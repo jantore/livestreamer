@@ -9,6 +9,7 @@ from livestreamer.stream import HDSStream, HLSStream, HTTPStream
 # This will have to be set to handle "secure" HDS streams. For now we
 # leave it empty, as the same streams can likely be watched with HLS.
 # SWF_URL = ""
+
 STREAM_TYPES = {
     "hds": {
         "parser": HDSStream.parse_manifest,
@@ -23,7 +24,7 @@ STREAM_TYPES = {
 }
 
 # For now we only handle MP4.
-STREAM_FORMATS = ("mp4")
+STREAM_FORMATS = ("mp4", "f4m", "m3u8")
 
 INFO_URL = "http://www.vgtv.no/data/actions/videostatus/"
 
@@ -93,22 +94,29 @@ class VGTV(Plugin):
         res = http.get(INFO_URL, params=dict(id=video_id))
         info = http.json(res, schema=_video_schema)
 
-        streams = {}
+        playlists = []
 
-        # At the time of writing, The previously fetched JSON doesn't
-        # point to playlist/manifest files, but to individual stream
-        # variants. Based on the provided variants, however, we can
-        # build the playlist URLs ourselves.
-
-        # HDS/HLS: Get all variants and produce a playlist URL.
         for f in ('hds', 'hls'):
             if not f in info["formats"]:
-                next
+                continue
+
+            for t in ('f4m', 'm3u8'):
+                if not t in info["formats"][f]:
+                    continue
+
+                for stream in info["formats"][f][t]:
+                    for p in stream["paths"]:
+                        playlists.append((f, self._build_url(**p)))
 
             if not "mp4" in info["formats"][f]:
-                next
+                continue
 
-            streamtype = STREAM_TYPES[f]
+            # We treat MP4 as a special case. Sometimes the previously
+            # fetched JSON doesn't point to playlist/manifest files,
+            # but to individual stream variants of type "mp4". Based
+            # on the provided variants, however, we can build the
+            # playlist/manifest URLs ourselves.
+
             f_streams = {}
             hmac = ""
 
@@ -123,27 +131,24 @@ class VGTV(Plugin):
                     else:
                         f_streams[url] = [variant]
 
+                    # Once again used for "secure" HDS streams.
                     if p["application"]:
-                        hmac = "?hdnea={0}&hdcore?3.1.0".format(
+                        hmac = "?hdnea={0}".format(
                             p["application"]
                         )
 
-            # Make playlist URL and pass to parser.
+            # Make playlist URL and add to our list.
             for url, variants in f_streams.items():
                 playlist = "{0}/,{1},.mp4.csmil/{2}{3}".format(
                     url,
                     ",".join(variants),
-                    streamtype["file"],
+                    STREAM_TYPES[f]["file"],
                     hmac
                 )
-                parser = streamtype["parser"]
-                params = streamtype.get("params") or {}
+                playlists.append((f, playlist))
 
-                try:
-                    streams.update(parser(self.session, playlist, **params))
-                except IOError as err:
-                    self.logger.error("Failed to extract {0} streams: {1}",
-                                      f.upper(), err)
+
+        streams = {}
 
         # HTTP: Also make direct content URLs available for use.
         http_formats = info["formats"].get("http")
@@ -153,6 +158,22 @@ class VGTV(Plugin):
                 url = "{0}/{1}".format(self._build_url(**p), p["filename"])
                 stream_name = "http_{0}k".format(stream["bitrate"])
                 streams[stream_name] = HTTPStream(self.session, url)
+
+        # Finally turn our playlists/manifests into streams.
+        for t, p in playlists:
+            parser = STREAM_TYPES[t].get("parser")
+            params = STREAM_TYPES[t].get("params") or {}
+
+            try:
+                streams.update(
+                    parser(self.session, p, **params)
+                )
+            except IOError as err:
+                self.logger.error(
+                    "Failed to extract {0} streams: {1}",
+                    f.upper(),
+                    err
+                )
 
         return streams
 
